@@ -53,7 +53,7 @@ streamlit_app.py ─ web UI  /  main.py ─ CLI
 ## Setup
 
 ```bash
-git clone https://github.com/<your-username>/cir-grading-assistant.git
+git clone https://github.com/SamarSaleh00/cir-grading-assistant.git
 cd cir-grading-assistant
 pip install -r requirements.txt
 ```
@@ -79,11 +79,7 @@ streamlit run streamlit_app.py
 ```
 
 ## Live deployment (Streamlit Community Cloud)
-This app is deployed at: **[add your live URL here]**
-
-To deploy your own copy: push this repo to GitHub, go to
-[share.streamlit.io](https://share.streamlit.io), point it at your repo with main file
-`streamlit_app.py`, and add `GEMINI_API_KEY` under the app's "Secrets" settings.
+This app is deployed at: **https://smartta.streamlit.app/**
 
 ## Known limitations
 - Written-question grading quality depends on how well the indexed course material covers the
