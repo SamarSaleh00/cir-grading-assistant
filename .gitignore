@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+gradebook.csv
+feedback_log.csv
+*.faiss
+
+.env
+.ipynb_checkpoints/
+.DS_Store

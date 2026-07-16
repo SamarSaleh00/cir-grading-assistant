@@ -1,0 +1,11 @@
+streamlit
+google-genai
+sentence-transformers
+torch
+torchvision
+faiss-cpu
+pdfplumber
+pdf2image
+pytesseract
+pandas
+pillow
