@@ -1,8 +1,8 @@
 """
 Conversational layer: lets the lecturer talk naturally. Uses Gemini function
-calling to route intents to grading/indexing/gradebook actions, plus a new
-analytics tool that answers questions about the gradebook data itself
-(highest/lowest scores, missing submissions, rankings, comparisons, etc.).
+calling to route intents to grading/indexing/gradebook actions, plus an
+analytics tool. Each assignment type keeps its own persistent question set,
+so switching between assignments never loses previously added questions.
 """
 
 from google.genai import types
@@ -13,12 +13,15 @@ from src.gradebook import update_grade, log_feedback, view_gradebook
 SYSTEM_INSTRUCTION = """You are a helpful teaching assistant that helps a lecturer grade student work
 and analyze grading data. You have tools to: set up assignments, add questions/rubrics, grade students
 (written or MCQ), approve or edit pending grades, view the gradebook, record attendance, and answer
-analytical questions about the gradebook (e.g. who scored highest, who is missing a submission,
-average scores, comparisons across students or assignments).
+analytical questions about the gradebook.
 
 Use the tools whenever the lecturer's message implies one of these actions — don't ask them to use
-special commands, just understand natural phrasing. If information is missing to call a tool
-(e.g. no rubric given yet), ask a clarifying question instead of guessing.
+special commands, just understand natural phrasing. Switching to a different assignment type is safe
+and never loses previously added questions for any assignment.
+
+If a tool call reports missing information (e.g. no rubric found), relay that tool's message exactly —
+do not invent your own explanation or guess what might be wrong. Always call the tool first; never
+describe a problem without having actually called the relevant tool to check.
 
 If the lecturer asks a question ABOUT the data (rankings, comparisons, who did/didn't do something,
 averages, etc.) rather than asking you to perform a new grading action, call analyze_gradebook.
@@ -30,12 +33,8 @@ def build_tools_config():
     return types.Tool(function_declarations=[
         types.FunctionDeclaration(
             name="set_assignment_context",
-            description="Start grading a new assignment type (e.g. Midterm, Final Exam, Assignment 1).",
-            parameters={
-                "type": "object",
-                "properties": {"assignment_type": {"type": "string"}},
-                "required": ["assignment_type"]
-            }
+            description="Switch to grading a given assignment type (e.g. Midterm, Final Exam, Assignment 1). Safe to call anytime — never loses that assignment's previously added questions.",
+            parameters={"type": "object", "properties": {"assignment_type": {"type": "string"}}, "required": ["assignment_type"]}
         ),
         types.FunctionDeclaration(
             name="add_written_question",
@@ -100,10 +99,7 @@ def build_tools_config():
             description="Edit the most recently shown grade result before saving.",
             parameters={
                 "type": "object",
-                "properties": {
-                    "new_score": {"type": "number"},
-                    "new_feedback": {"type": "string"}
-                }
+                "properties": {"new_score": {"type": "number"}, "new_feedback": {"type": "string"}}
             }
         ),
         types.FunctionDeclaration(
@@ -126,16 +122,10 @@ def build_tools_config():
         ),
         types.FunctionDeclaration(
             name="analyze_gradebook",
-            description=(
-                "Answer analytical questions about the gradebook data, such as: who scored highest/"
-                "lowest overall or on a specific assignment, which students are missing a submission "
-                "(blank/NaN) for a given assignment, class averages, rankings, or comparisons between "
-                "students or assignment types. Call this for ANY question about existing data rather "
-                "than a request to grade something new."
-            ),
+            description="Answer analytical questions about the gradebook data (rankings, comparisons, missing submissions, averages).",
             parameters={
                 "type": "object",
-                "properties": {"question": {"type": "string", "description": "The lecturer's analytical question, verbatim or paraphrased"}},
+                "properties": {"question": {"type": "string"}},
                 "required": ["question"]
             }
         ),
@@ -145,25 +135,18 @@ def build_tools_config():
 ANALYTICS_PROMPT = """You are analyzing a lecturer's gradebook to answer their question.
 
 Gradebook (wide format — one row per student, one column per assignment type; blank/NaN means
-that student has no recorded score for that assignment, which usually means it wasn't graded or
-submitted yet):
+that student has no recorded score for that assignment):
 
 {table}
 
 Lecturer's question: "{question}"
 
-Answer accurately based ONLY on the data above. If the question involves a column that doesn't
-exist in the table, say so rather than guessing. If it asks about missing submissions, look for
-NaN/blank values. Be concise and specific (name the actual students/numbers involved).
+Answer accurately based ONLY on the data above. If a referenced column doesn't exist, say so.
+Be concise and specific (name actual students/numbers).
 """
 
 
 class GradingAssistant:
-    """
-    Wraps session state + the conversational loop. Instantiate once per grading
-    session (e.g. one per uploaded course index), then call .send(message) repeatedly.
-    """
-
     def __init__(self, index, chunks, model=DEFAULT_MODEL):
         self.model = model
         self.tools_config = build_tools_config()
@@ -172,8 +155,7 @@ class GradingAssistant:
             "index": index,
             "chunks": chunks,
             "current_assignment": None,
-            "written_questions": {},
-            "mcq_questions": {},
+            "assignments": {},   # assignment_type -> {"written_questions": {}, "mcq_questions": {}}
             "pending_grade": None
         }
         self.dispatch = {
@@ -189,27 +171,52 @@ class GradingAssistant:
             "analyze_gradebook": self._analyze_gradebook,
         }
 
+    def _get_assignment_bucket(self, assignment_type):
+        """Returns (creating if needed) the persistent question store for an assignment type."""
+        if assignment_type not in self.state["assignments"]:
+            self.state["assignments"][assignment_type] = {"written_questions": {}, "mcq_questions": {}}
+        return self.state["assignments"][assignment_type]
+
+    def _current_bucket(self):
+        at = self.state["current_assignment"]
+        if at is None:
+            return None
+        return self._get_assignment_bucket(at)
+
     # ---- tool implementations ----
 
     def _set_assignment_context(self, assignment_type):
         self.state["current_assignment"] = assignment_type
-        self.state["written_questions"] = {}
-        self.state["mcq_questions"] = {}
-        return f"Now grading: {assignment_type}. Ready for questions/rubrics."
+        self._get_assignment_bucket(assignment_type)  # ensure it exists, doesn't wipe if already there
+        bucket = self._current_bucket()
+        n_written = len(bucket["written_questions"])
+        n_mcq = len(bucket["mcq_questions"])
+        if n_written or n_mcq:
+            return f"Switched to {assignment_type}. It already has {n_mcq} MCQ(s) and {n_written} written question(s) set up."
+        return f"Switched to {assignment_type}. No questions added yet."
 
     def _add_written_question(self, question_id, question_text, rubric_text):
-        self.state["written_questions"][question_id] = {"question_text": question_text, "rubric_text": rubric_text}
-        return f"Added written question {question_id}: {question_text}"
+        bucket = self._current_bucket()
+        if bucket is None:
+            return "No assignment is currently selected. Please specify an assignment type first."
+        bucket["written_questions"][question_id] = {"question_text": question_text, "rubric_text": rubric_text}
+        return f"Added written question {question_id} to {self.state['current_assignment']}: {question_text}"
 
     def _add_mcq_question(self, question_id, correct_answer, points):
-        self.state["mcq_questions"][question_id] = {"correct_answer": correct_answer, "points": points}
-        return f"Added MCQ {question_id}, correct answer {correct_answer}, {points} points"
+        bucket = self._current_bucket()
+        if bucket is None:
+            return "No assignment is currently selected. Please specify an assignment type first."
+        bucket["mcq_questions"][question_id] = {"correct_answer": correct_answer, "points": points}
+        return f"Added MCQ {question_id} to {self.state['current_assignment']}, correct answer {correct_answer}, {points} points"
 
     def _grade_student_written(self, student_id, student_name, question_id, student_answer):
-        q = self.state["written_questions"].get(question_id)
-        if not q:
-            return f"No rubric found for question {question_id}. Please provide the rubric first."
+        bucket = self._current_bucket()
+        if bucket is None or question_id not in bucket["written_questions"]:
+            available = list(bucket["written_questions"].keys()) if bucket else []
+            return (f"No rubric found for question '{question_id}' under {self.state['current_assignment']}. "
+                    f"Available written questions here: {available}. Please add the rubric first.")
 
+        q = bucket["written_questions"][question_id]
         criteria = parse_rubric(q["rubric_text"])
         result = grade_question(criteria, student_answer, self.state["index"], self.state["chunks"])
 
@@ -225,8 +232,12 @@ class GradingAssistant:
                 f"Awaiting your approval — say 'approve' or give me a correction.")
 
     def _grade_student_mcq(self, student_id, student_name, answers):
+        bucket = self._current_bucket()
+        if bucket is None or not bucket["mcq_questions"]:
+            return f"No MCQ questions found under {self.state['current_assignment']}. Please add them first."
+
         mcq_list = [{"id": qid, "correct": q["correct_answer"], "points": q["points"]}
-                    for qid, q in self.state["mcq_questions"].items()]
+                    for qid, q in bucket["mcq_questions"].items()]
         result = grade_mcq_section(mcq_list, answers)
         feedback = format_mcq_feedback(result["mcq_results"])
 
@@ -243,7 +254,6 @@ class GradingAssistant:
         pg = self.state["pending_grade"]
         if not pg:
             return "There's no pending grade to approve."
-
         update_grade(pg["student_id"], pg["student_name"], pg["assignment_type"], pg["score"])
         log_feedback(pg["student_id"], pg["student_name"], pg["assignment_type"], pg["feedback"])
         self.state["pending_grade"] = None
@@ -253,12 +263,10 @@ class GradingAssistant:
         pg = self.state["pending_grade"]
         if not pg:
             return "There's no pending grade to edit."
-
         if new_score is not None:
             pg["score"] = new_score
         if new_feedback:
             pg["feedback"] = new_feedback
-
         update_grade(pg["student_id"], pg["student_name"], pg["assignment_type"], pg["score"])
         log_feedback(pg["student_id"], pg["student_name"], pg["assignment_type"], pg["feedback"])
         self.state["pending_grade"] = None
@@ -273,14 +281,9 @@ class GradingAssistant:
         return f"Recorded attendance for {student_name}: {score}"
 
     def _analyze_gradebook(self, question):
-        """
-        Answers analytical questions about the gradebook by handing the full
-        table + the question to Gemini as a plain (non-tool) call.
-        """
         df = view_gradebook()
         if df is None or df.empty:
             return "The gradebook is currently empty — nothing to analyze yet."
-
         table_str = df.to_string(index=False)
         prompt = ANALYTICS_PROMPT.format(table=table_str, question=question)
         response = call_gemini_with_retry(self.model, prompt)
@@ -292,25 +295,15 @@ class GradingAssistant:
         return "".join(p.text for p in content.parts if getattr(p, "text", None))
 
     def send(self, user_message, max_tool_rounds=5):
-        """
-        Sends one lecturer message, resolves any chain of tool calls, and
-        returns the final natural-language reply.
-        """
         self.chat_history.append(types.Content(role="user", parts=[types.Part(text=user_message)]))
-
-        config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            tools=[self.tools_config]
-        )
+        config = types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION, tools=[self.tools_config])
 
         for _ in range(max_tool_rounds):
             response = call_gemini_with_retry(self.model, self.chat_history, config=config)
-
             candidate = response.candidates[0]
             self.chat_history.append(candidate.content)
 
             function_calls = [p.function_call for p in candidate.content.parts if p.function_call]
-
             if not function_calls:
                 text = self._extract_text(candidate.content)
                 return text if text else "(no response)"
@@ -323,4 +316,4 @@ class GradingAssistant:
 
             self.chat_history.append(types.Content(role="user", parts=tool_results))
 
-        return "(Reached max tool-call rounds without a final reply — this may indicate a loop; check the conversation.)"
+        return "(Reached max tool-call rounds without a final reply.)"
